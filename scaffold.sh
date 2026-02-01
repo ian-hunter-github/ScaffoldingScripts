@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# -----------------------------
+# defaults
+# -----------------------------
+FRONTEND="vanilla-ts"
+DB="none"
+E2E="false"
+
+usage() {
+  cat <<'TXT'
+Usage: scaffold.sh <project-name> [options]
+
+Options:
+  --frontend vanilla-ts|react-ts
+  --db none|supabase
+  --e2e                      Add Playwright E2E scaffold
+  -h, --help
+
+Unknown flags cause an error.
+TXT
+}
+
+log() { printf '[scaffold] %s\n' "$*"; }
+die() { printf '[scaffold] ERROR: %s\n' "$*" >&2; exit 1; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
+
+copy_file() {
+  local src="$1"
+  local dst="$2"
+  [[ -f "$src" ]] || die "Missing template file: $src"
+  mkdir -p "$(dirname "$dst")"
+  cp "$src" "$dst"
+}
+
+copy_dir() {
+  local src_dir="$1"
+  local dst_dir="$2"
+  [[ -d "$src_dir" ]] || die "Missing template dir: $src_dir"
+  mkdir -p "$dst_dir"
+  cp -R "$src_dir"/. "$dst_dir"/
+}
+
+# -----------------------------
+# args
+# -----------------------------
+[[ $# -ge 1 ]] || { usage; exit 1; }
+PROJECT_NAME="$1"; shift
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --frontend) FRONTEND="${2:-}"; shift 2 ;;
+    --db) DB="${2:-}"; shift 2 ;;
+    --e2e) E2E="true"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "Unknown option: $1" ;;
+    *)  die "Unexpected argument: $1" ;;
+  esac
+done
+
+[[ $# -eq 0 ]] || die "Unexpected trailing args: $*"
+
+case "$FRONTEND" in
+  vanilla-ts|react-ts) ;;
+  *) die "Invalid --frontend: $FRONTEND" ;;
+esac
+
+case "$DB" in
+  none|supabase) ;;
+  *) die "Invalid --db: $DB" ;;
+esac
+
+[[ "$PROJECT_NAME" != -* ]] || die "Project name cannot start with '-'"
+[[ ! -e "$PROJECT_NAME" ]] || die "Path already exists: $PROJECT_NAME"
+
+# -----------------------------
+# locate Templates relative to this script
+# -----------------------------
+SCAFFOLD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEMPLATES_DIR="$SCAFFOLD_DIR/Templates"
+
+[[ -d "$TEMPLATES_DIR" ]] || die "Templates folder missing: $TEMPLATES_DIR"
+[[ -f "$TEMPLATES_DIR/provision.sh" ]] || die "Missing template: $TEMPLATES_DIR/provision.sh"
+[[ -f "$TEMPLATES_DIR/check-tools.mjs" ]] || die "Missing template: $TEMPLATES_DIR/check-tools.mjs"
+
+# New required templates for the “real starter app”
+[[ -f "$TEMPLATES_DIR/netlify/netlify.toml" ]] || die "Missing template: $TEMPLATES_DIR/netlify/netlify.toml"
+[[ -f "$TEMPLATES_DIR/functions/healthcheck.none.mjs" ]] || die "Missing template: $TEMPLATES_DIR/functions/healthcheck.none.mjs"
+[[ -f "$TEMPLATES_DIR/functions/healthcheck.supabase.mjs" ]] || die "Missing template: $TEMPLATES_DIR/functions/healthcheck.supabase.mjs"
+[[ -d "$TEMPLATES_DIR/app/$FRONTEND" ]] || die "Missing app template dir: $TEMPLATES_DIR/app/$FRONTEND"
+
+# -----------------------------
+# tool checks
+# -----------------------------
+need_cmd node
+need_cmd npm
+need_cmd git
+
+# -----------------------------
+# create Vite project non-interactively
+#   --no-interactive avoids prompts (incl rolldown question)
+#   --no-immediate avoids auto npm install + npm run dev
+# -----------------------------
+log "Creating Vite project: $PROJECT_NAME ($FRONTEND)"
+npm create vite@latest "$PROJECT_NAME" -- \
+  --template "$FRONTEND" \
+  --no-interactive \
+  --no-immediate
+
+cd "$PROJECT_NAME"
+
+log "Installing dependencies"
+npm install
+
+# -----------------------------
+# folders
+# -----------------------------
+mkdir -p scripts .scaffold netlify/functions sql
+
+# -----------------------------
+# meta
+# -----------------------------
+cat > .scaffold/meta.json <<EOF
+{
+  "frontend": "$FRONTEND",
+  "db": "$DB",
+  "deploy": "netlify"
+}
+EOF
+
+# -----------------------------
+# scripts from Templates
+# -----------------------------
+cp "$TEMPLATES_DIR/provision.sh" scripts/provision.sh
+cp "$TEMPLATES_DIR/check-tools.mjs" scripts/check-tools.mjs
+chmod +x scripts/provision.sh
+
+[[ -f "scripts/provision.sh" ]] || die "provision.sh copy failed"
+[[ -f "scripts/check-tools.mjs" ]] || die "check-tools.mjs copy failed"
+
+# -----------------------------
+# Netlify config + Function
+# -----------------------------
+copy_file "$TEMPLATES_DIR/netlify/netlify.toml" "netlify.toml"
+
+if [[ "$DB" == "supabase" ]]; then
+  log "Adding Supabase server dependency for Netlify Function"
+  npm install @supabase/supabase-js
+  copy_file "$TEMPLATES_DIR/functions/healthcheck.supabase.mjs" "netlify/functions/healthcheck.mjs"
+else
+  copy_file "$TEMPLATES_DIR/functions/healthcheck.none.mjs" "netlify/functions/healthcheck.mjs"
+fi
+
+# -----------------------------
+# Replace default Vite src with our starter app templates
+# -----------------------------
+log "Applying starter app template for $FRONTEND"
+copy_dir "$TEMPLATES_DIR/app/$FRONTEND/src" "src"
+
+# -----------------------------
+# Minimal SQL templates for --apply-schema (only when db=supabase)
+# -----------------------------
+if [[ "$DB" == "supabase" ]]; then
+  cat > sql/bootstrap.sql <<'SQL'
+create table if not exists public.healthcheck (
+  id bigint generated by default as identity primary key,
+  name text not null unique,
+  created_at timestamptz not null default now()
+);
+SQL
+
+  cat > sql/seed.sql <<'SQL'
+insert into public.healthcheck (name)
+values ('initial')
+on conflict (name) do nothing;
+SQL
+fi
+
+# -----------------------------
+# Supabase config
+# -----------------------------
+if [[ "$DB" == "supabase" ]]; then
+  # Adjust org_slug/region defaults to yours
+  cat > supabase.config.json <<EOF
+{
+  "project": {
+    "name": "$PROJECT_NAME",
+    "org_slug": "tsykazrmeprfoyddkocc",
+    "region": "eu-west-2"
+  }
+}
+EOF
+fi
+
+# -----------------------------
+# optional E2E scaffold
+# -----------------------------
+if [[ "$E2E" == "true" ]]; then
+  log "Adding Playwright E2E scaffold"
+  npm install -D @playwright/test
+  npx playwright install
+  mkdir -p tests/e2e
+fi
+
+# -----------------------------
+# git
+# -----------------------------
+git init >/dev/null
+git add .
+git commit -m "Initial scaffold" >/dev/null
+
+log "Scaffold complete: $(pwd)"
+log "Next: ./scripts/provision.sh [--create-db] [--apply-schema]"
+log "Then run locally: netlify dev"

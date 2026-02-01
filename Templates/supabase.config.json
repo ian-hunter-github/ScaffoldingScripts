@@ -1,0 +1,8 @@
+{
+  "project": {
+    "name": "__PROJECT_NAME__",
+    "org_slug": "__SUPABASE_ORG_SLUG__",
+    "provider": "__SUPABASE_PROVIDER__",
+    "region": "__SUPABASE_REGION__"
+  }
+}
