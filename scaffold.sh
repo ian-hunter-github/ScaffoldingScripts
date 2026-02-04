@@ -1,217 +1,232 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# -----------------------------
+# ------------------------------------------------------------
 # defaults
-# -----------------------------
-FRONTEND="vanilla-ts"
+# ------------------------------------------------------------
+UIS=()
+EXAMPLE="minimal"
 DB="none"
-E2E="false"
 
 usage() {
   cat <<'TXT'
-Usage: scaffold.sh <project-name> [options]
+Usage:
+  scaffold.sh <project-name> [options]
 
 Options:
-  --frontend vanilla-ts|react-ts
+  --ui web-react|mobile-react-native|desktop-tauri   (repeatable)
+  --example minimal|advanced
   --db none|supabase
-  --e2e                      Add Playwright E2E scaffold
   -h, --help
 
-Unknown flags cause an error.
+Examples:
+  scaffold.sh myapp --ui web-react
+  scaffold.sh myapp --ui web-react --ui mobile-react-native --example advanced --db supabase
 TXT
 }
 
 log() { printf '[scaffold] %s\n' "$*"; }
 die() { printf '[scaffold] ERROR: %s\n' "$*" >&2; exit 1; }
 
-need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"; }
-
-copy_file() {
-  local src="$1"
-  local dst="$2"
-  [[ -f "$src" ]] || die "Missing template file: $src"
-  mkdir -p "$(dirname "$dst")"
-  cp "$src" "$dst"
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
 
 copy_dir() {
-  local src_dir="$1"
-  local dst_dir="$2"
-  [[ -d "$src_dir" ]] || die "Missing template dir: $src_dir"
-  mkdir -p "$dst_dir"
-  cp -R "$src_dir"/. "$dst_dir"/
+  local src="$1" dst="$2"
+  [[ -d "$src" ]] || die "Missing template dir: $src"
+  mkdir -p "$dst"
+  cp -R "$src"/. "$dst"/
 }
 
-# -----------------------------
+create_vite_app() {
+  local dst="$1" template="$2"
+  [[ -n "$dst" ]] || die "create_vite_app: missing dst"
+  [[ -n "$template" ]] || die "create_vite_app: missing template"
+  [[ ! -e "$dst" ]] || die "Vite destination already exists (refusing to overwrite): $dst"
+
+  log "Creating Vite app: $dst (template=$template)"
+  mkdir -p "$(dirname "$dst")"
+
+  # Force non-interactive behaviour.
+  # - CI=1 suppresses prompts in many CLIs
+  # - printf 'n\n' answers the rolldown question “No” if it still appears
+  CI=1 printf 'n\n' | npm create vite@latest "$dst" -- --template "$template" --no-install
+
+  (cd "$dst" && npm install)
+}
+
+write_meta_json() {
+  local mode="$1" example="$2" db="$3"
+  node - "$mode" "$example" "$db" "${UIS[@]}" <<'NODE'
+const fs = require('fs');
+
+const mode = process.argv[2];
+const example = process.argv[3];
+const db = process.argv[4];
+const uis = process.argv.slice(5);
+
+const meta = { mode, ui: uis, example, db };
+fs.writeFileSync('.scaffold/meta.json', JSON.stringify(meta, null, 2));
+NODE
+}
+
+overlay_ui_src() {
+  local ui="$1" appdir="$2"
+  local srcdir="$TEMPLATES_DIR/apps/$ui/src"
+  local dstdir="$appdir/src"
+
+  log "Looking for UI template src dir: $srcdir"
+  [[ -d "$srcdir" ]] || die "UI template src dir missing: $srcdir"
+
+  log "Overlaying UI src: $ui -> $dstdir"
+  copy_dir "$srcdir" "$dstdir"
+}
+
+# ------------------------------------------------------------
 # args
-# -----------------------------
+# ------------------------------------------------------------
 [[ $# -ge 1 ]] || { usage; exit 1; }
-PROJECT_NAME="$1"; shift
+PROJECT="$1"; shift
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --frontend) FRONTEND="${2:-}"; shift 2 ;;
-    --db) DB="${2:-}"; shift 2 ;;
-    --e2e) E2E="true"; shift ;;
+    --ui) UIS+=("$2"); shift 2 ;;
+    --example) EXAMPLE="$2"; shift 2 ;;
+    --db) DB="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    --) shift; break ;;
-    -*) die "Unknown option: $1" ;;
-    *)  die "Unexpected argument: $1" ;;
+    *) die "Unknown option: $1" ;;
   esac
 done
 
-[[ $# -eq 0 ]] || die "Unexpected trailing args: $*"
+[[ "${#UIS[@]}" -gt 0 ]] || die "At least one --ui is required"
+case "$EXAMPLE" in minimal|advanced) ;; *) die "Invalid --example: $EXAMPLE" ;; esac
+case "$DB" in none|supabase) ;; *) die "Invalid --db: $DB" ;; esac
+[[ ! -e "$PROJECT" ]] || die "Path already exists: $PROJECT"
 
-case "$FRONTEND" in
-  vanilla-ts|react-ts) ;;
-  *) die "Invalid --frontend: $FRONTEND" ;;
-esac
+MODE="single"
+[[ "${#UIS[@]}" -gt 1 ]] && MODE="monorepo"
 
-case "$DB" in
-  none|supabase) ;;
-  *) die "Invalid --db: $DB" ;;
-esac
+# ------------------------------------------------------------
+# locate Templates
+# ------------------------------------------------------------
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEMPLATES_DIR="$SCRIPTS_DIR/Templates"
 
-[[ "$PROJECT_NAME" != -* ]] || die "Project name cannot start with '-'"
-[[ ! -e "$PROJECT_NAME" ]] || die "Path already exists: $PROJECT_NAME"
-
-# -----------------------------
-# locate Templates relative to this script
-# -----------------------------
-SCAFFOLD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEMPLATES_DIR="$SCAFFOLD_DIR/Templates"
-
-[[ -d "$TEMPLATES_DIR" ]] || die "Templates folder missing: $TEMPLATES_DIR"
+[[ -d "$TEMPLATES_DIR" ]] || die "Templates directory missing: $TEMPLATES_DIR"
 [[ -f "$TEMPLATES_DIR/provision.sh" ]] || die "Missing template: $TEMPLATES_DIR/provision.sh"
 [[ -f "$TEMPLATES_DIR/check-tools.mjs" ]] || die "Missing template: $TEMPLATES_DIR/check-tools.mjs"
+[[ -f "$TEMPLATES_DIR/base/netlify.toml" ]] || die "Missing template: $TEMPLATES_DIR/base/netlify.toml"
 
-# New required templates for the “real starter app”
-[[ -f "$TEMPLATES_DIR/netlify/netlify.toml" ]] || die "Missing template: $TEMPLATES_DIR/netlify/netlify.toml"
-[[ -f "$TEMPLATES_DIR/functions/healthcheck.none.mjs" ]] || die "Missing template: $TEMPLATES_DIR/functions/healthcheck.none.mjs"
-[[ -f "$TEMPLATES_DIR/functions/healthcheck.supabase.mjs" ]] || die "Missing template: $TEMPLATES_DIR/functions/healthcheck.supabase.mjs"
-[[ -d "$TEMPLATES_DIR/app/$FRONTEND" ]] || die "Missing app template dir: $TEMPLATES_DIR/app/$FRONTEND"
-
-# -----------------------------
-# tool checks
-# -----------------------------
 need_cmd node
 need_cmd npm
-need_cmd git
 
-# -----------------------------
-# create Vite project non-interactively
-#   --no-interactive avoids prompts (incl rolldown question)
-#   --no-immediate avoids auto npm install + npm run dev
-# -----------------------------
-log "Creating Vite project: $PROJECT_NAME ($FRONTEND)"
-npm create vite@latest "$PROJECT_NAME" -- \
-  --template "$FRONTEND" \
-  --no-interactive \
-  --no-immediate
+# ------------------------------------------------------------
+# create project
+# ------------------------------------------------------------
+mkdir "$PROJECT"
+cd "$PROJECT"
 
-cd "$PROJECT_NAME"
+mkdir -p .scaffold
+write_meta_json "$MODE" "$EXAMPLE" "$DB"
 
-log "Installing dependencies"
-npm install
-
-# -----------------------------
-# folders
-# -----------------------------
-mkdir -p scripts .scaffold netlify/functions sql
-
-# -----------------------------
-# meta
-# -----------------------------
-cat > .scaffold/meta.json <<EOF
-{
-  "frontend": "$FRONTEND",
-  "db": "$DB",
-  "deploy": "netlify"
-}
-EOF
-
-# -----------------------------
-# scripts from Templates
-# -----------------------------
+mkdir -p scripts
 cp "$TEMPLATES_DIR/provision.sh" scripts/provision.sh
 cp "$TEMPLATES_DIR/check-tools.mjs" scripts/check-tools.mjs
 chmod +x scripts/provision.sh
 
-[[ -f "scripts/provision.sh" ]] || die "provision.sh copy failed"
-[[ -f "scripts/check-tools.mjs" ]] || die "check-tools.mjs copy failed"
+# Always create a netlify.toml at repo root
+cp "$TEMPLATES_DIR/base/netlify.toml" netlify.toml
 
-# -----------------------------
-# Netlify config + Function
-# -----------------------------
-copy_file "$TEMPLATES_DIR/netlify/netlify.toml" "netlify.toml"
+# ------------------------------------------------------------
+# base templates (advanced example only)
+# ------------------------------------------------------------
+if [[ "$EXAMPLE" == "advanced" ]]; then
+  log "Applying base templates (advanced)"
+  copy_dir "$TEMPLATES_DIR/base/sql" sql
+  copy_dir "$TEMPLATES_DIR/base/services" services
+  copy_dir "$TEMPLATES_DIR/base/packages" packages
 
+  # Support either name, but write as package.json in project root
+  if [[ -f "$TEMPLATES_DIR/base/package.json" ]]; then
+    cp "$TEMPLATES_DIR/base/package.json" package.json
+  elif [[ -f "$TEMPLATES_DIR/base/packages.json" ]]; then
+    cp "$TEMPLATES_DIR/base/packages.json" package.json
+  fi
+
+  if [[ -f "package.json" ]]; then
+    npm install
+  fi
+fi
+
+# DB config template
 if [[ "$DB" == "supabase" ]]; then
-  log "Adding Supabase server dependency for Netlify Function"
-  npm install @supabase/supabase-js
-  copy_file "$TEMPLATES_DIR/functions/healthcheck.supabase.mjs" "netlify/functions/healthcheck.mjs"
-else
-  copy_file "$TEMPLATES_DIR/functions/healthcheck.none.mjs" "netlify/functions/healthcheck.mjs"
+  [[ -f "$TEMPLATES_DIR/base/supabase.config.json" ]] || die "Missing template: $TEMPLATES_DIR/base/supabase.config.json"
+  sed "s/__PROJECT_NAME__/${PROJECT}/g" \
+    "$TEMPLATES_DIR/base/supabase.config.json" > supabase.config.json
 fi
 
-# -----------------------------
-# Replace default Vite src with our starter app templates
-# -----------------------------
-log "Applying starter app template for $FRONTEND"
-copy_dir "$TEMPLATES_DIR/app/$FRONTEND/src" "src"
+# ------------------------------------------------------------
+# apps
+# ------------------------------------------------------------
+mkdir -p apps
 
-# -----------------------------
-# Minimal SQL templates for --apply-schema (only when db=supabase)
-# -----------------------------
-if [[ "$DB" == "supabase" ]]; then
-  cat > sql/bootstrap.sql <<'SQL'
-create table if not exists public.healthcheck (
-  id bigint generated by default as identity primary key,
-  name text not null unique,
-  created_at timestamptz not null default now()
-);
-SQL
+for ui in "${UIS[@]}"; do
+  case "$ui" in
+    web-react)
+      # 1) Create the Vite app FIRST
+      create_vite_app "apps/web" "react-ts"
 
-  cat > sql/seed.sql <<'SQL'
-insert into public.healthcheck (name)
-values ('initial')
-on conflict (name) do nothing;
-SQL
+      # 2) Option A: template owns package.json for the app
+      if [[ -f "$TEMPLATES_DIR/apps/$ui/package.json" ]]; then
+        log "Copying template package.json for $ui -> apps/web/package.json"
+        cp "$TEMPLATES_DIR/apps/$ui/package.json" "apps/web/package.json"
+        (cd "apps/web" && npm install)
+      else
+        die "Missing template package.json for $ui: $TEMPLATES_DIR/apps/$ui/package.json"
+      fi
+
+      # 3) Overlay template src/ into the created app
+      overlay_ui_src "$ui" "apps/web"
+
+      # Fail loudly if overlay didn't create expected structure
+      [[ -f "apps/web/src/App.tsx" ]] || die "Missing apps/web/src/App.tsx after overlay"
+      [[ -d "apps/web/src/app" ]] || die "Overlay failed: apps/web/src/app not created"
+      ;;
+
+    mobile-react-native)
+      mkdir -p apps/mobile/src
+      overlay_ui_src "$ui" "apps/mobile"
+      ;;
+    desktop-tauri)
+      mkdir -p apps/desktop/src
+      overlay_ui_src "$ui" "apps/desktop"
+      ;;
+    *)
+      die "Unknown UI: $ui"
+      ;;
+  esac
+done
+
+# ------------------------------------------------------------
+# git init (optional, safe)
+# ------------------------------------------------------------
+if command -v git >/dev/null 2>&1; then
+  if [[ ! -d .git ]]; then
+    git init >/dev/null 2>&1 || true
+    git add -A >/dev/null 2>&1 || true
+    git commit -m "Scaffold project" >/dev/null 2>&1 || true
+  fi
 fi
 
-# -----------------------------
-# Supabase config
-# -----------------------------
-if [[ "$DB" == "supabase" ]]; then
-  # Adjust org_slug/region defaults to yours
-  cat > supabase.config.json <<EOF
-{
-  "project": {
-    "name": "$PROJECT_NAME",
-    "org_slug": "tsykazrmeprfoyddkocc",
-    "region": "eu-west-2"
-  }
-}
-EOF
-fi
-
-# -----------------------------
-# optional E2E scaffold
-# -----------------------------
-if [[ "$E2E" == "true" ]]; then
-  log "Adding Playwright E2E scaffold"
-  npm install -D @playwright/test
-  npx playwright install
-  mkdir -p tests/e2e
-fi
-
-# -----------------------------
-# git
-# -----------------------------
-git init >/dev/null
-git add .
-git commit -m "Initial scaffold" >/dev/null
-
-log "Scaffold complete: $(pwd)"
-log "Next: ./scripts/provision.sh [--create-db] [--apply-schema]"
-log "Then run locally: netlify dev"
+log "Scaffold complete:"
+log "  project: $PROJECT"
+log "  mode:    $MODE"
+log "  ui:      ${UIS[*]}"
+log "  example: $EXAMPLE"
+log "  db:      $DB"
+log ""
+log "Next:"
+log "  cd $PROJECT"
+log "  ./scripts/provision.sh --create-db --apply-schema"
+log "  netlify dev"

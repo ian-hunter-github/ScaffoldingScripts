@@ -1,0 +1,10 @@
+[build]
+command = "npm --prefix apps/web run build"
+publish = "apps/web/dist"
+functions = "services/api/netlify/functions"
+
+[dev]
+command = "npm --prefix apps/web run dev"
+targetPort = 5173
+port = 8888
+functions = "services/api/netlify/functions"
