@@ -265,6 +265,13 @@ if [[ "$EXAMPLE" == "advanced" ]]; then
     chmod +x scripts/test-api.sh || true
   fi
 
+  # Copy optional dev runner into project scripts/
+  if [[ -f "$TEMPLATES_DIR/base/scripts/dev.sh" ]]; then
+    log "Copying dev runner -> scripts/dev.sh"
+    cp "$TEMPLATES_DIR/base/scripts/dev.sh" scripts/dev.sh
+    chmod +x scripts/dev.sh || true
+  fi
+
   # Root package.json (optional but recommended for advanced)
   if [[ -f "$TEMPLATES_DIR/base/package.json" ]]; then
     cp "$TEMPLATES_DIR/base/package.json" package.json
