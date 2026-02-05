@@ -15,7 +15,7 @@ export default function App() {
         const res = await fetch("/.netlify/functions/projects");
         const json = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`);
-        const list = (json as any)?.projects ?? [];
+        const list = (json as any)?.data ?? [];
         setProjects(list);
         if (list.length) setProjectId(list[0].id);
       } catch (e: any) {

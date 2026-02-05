@@ -1,331 +1,241 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# write-api-functions.sh
-# Writes ESM Netlify Functions templates under:
-#   Scripts/Templates/base/services/api/netlify/functions/
+# write-api-integration-tests.sh
+# Writes API integration tests (Node built-in test runner) into:
+#   Scripts/Templates/base/tests/api/
+#
+# These tests call Netlify Function handlers directly (no netlify dev required).
+# They require real Supabase env vars at test time:
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_ROLE_KEY
+#
+# NOTE: Your scaffold.sh must copy Templates/base/tests into new projects for these
+# to appear in scaffolded output (if it doesn’t already).
 
-ROOT_DIR="$(pwd)"
-TEMPL_DIR="$ROOT_DIR/Scripts/Templates/base/services/api/netlify/functions"
-LIB_DIR="$TEMPL_DIR/_lib"
+ROOT_DIR="${HOME}"
+OUT_DIR="$ROOT_DIR/Scripts/Templates/base/tests/api"
 
-mkdir -p "$LIB_DIR"
+mkdir -p "$OUT_DIR"
 
 # -------------------------
-# _lib/http.mjs
+# helpers.mjs
 # -------------------------
-cat > "$LIB_DIR/http.mjs" <<'EOF'
-export const CORS_HEADERS = {
-  "access-control-allow-origin": "*",
-  "access-control-allow-methods": "GET,POST,PATCH,DELETE,OPTIONS",
-  "access-control-allow-headers": "content-type",
-  "access-control-max-age": "86400",
-};
+cat > "$OUT_DIR/helpers.mjs" <<'EOF'
+import { randomUUID } from "node:crypto";
+import { setTimeout as sleep } from "node:timers/promises";
 
-export function json(statusCode, body, extraHeaders = {}) {
-  return {
-    statusCode,
+/**
+ * Minimal Netlify event builder for handler(event).
+ */
+export function mkEvent({ method = "GET", bodyObj, query } = {}) {
+  const ev = {
+    httpMethod: method,
     headers: {
-      "content-type": "application/json; charset=utf-8",
-      ...CORS_HEADERS,
-      ...extraHeaders,
+      "content-type": "application/json",
     },
-    body: JSON.stringify(body ?? null),
+    queryStringParameters: query || undefined,
+    body: bodyObj === undefined ? null : JSON.stringify(bodyObj),
   };
+  return ev;
 }
 
-export function ok(data) {
-  return json(200, { data });
-}
-
-export function created(data) {
-  return json(201, { data });
-}
-
-export function badRequest(message, hint) {
-  return json(400, { error: message, ...(hint ? { hint } : {}) });
-}
-
-export function notFound(message = "Not found") {
-  return json(404, { error: message });
-}
-
-export function methodNotAllowed(method) {
-  return json(405, { error: `Method not allowed: ${method}` });
-}
-
-export function serverError(message, hint) {
-  return json(500, { error: message, ...(hint ? { hint } : {}) });
-}
-
-export function handleOptions(event) {
-  if ((event.httpMethod || "").toUpperCase() === "OPTIONS") {
-    return json(204, null);
-  }
-  return null;
-}
-
-export function getQuery(event) {
-  return event.queryStringParameters || {};
-}
-EOF
-
-# -------------------------
-# _lib/validate.mjs
-# -------------------------
-cat > "$LIB_DIR/validate.mjs" <<'EOF'
-export function safeJsonParse(text) {
+export function parseJsonBody(resp) {
+  if (!resp || typeof resp.body !== "string") return null;
   try {
-    return { ok: true, value: JSON.parse(text) };
-  } catch (e) {
-    return { ok: false, error: e };
+    return JSON.parse(resp.body);
+  } catch {
+    return null;
   }
 }
 
-export function readJsonBody(event) {
-  const raw = event.body ?? "";
-  if (!raw) return { ok: true, value: {} };
-
-  const parsed = safeJsonParse(raw);
-  if (!parsed.ok) return { ok: false, error: "Invalid JSON body" };
-  if (parsed.value === null || typeof parsed.value !== "object" || Array.isArray(parsed.value)) {
-    return { ok: false, error: "JSON body must be an object" };
-  }
-  return { ok: true, value: parsed.value };
+export function uniqueName(prefix = "it") {
+  return `${prefix}-${new Date().toISOString().replace(/[:.TZ-]/g, "")}-${randomUUID().slice(0, 8)}`;
 }
 
-export function requireString(obj, key, { min = 1, max = 200 } = {}) {
-  const v = obj?.[key];
-  if (typeof v !== "string") return { ok: false, error: `${key} must be a string` };
-  const s = v.trim();
-  if (s.length < min) return { ok: false, error: `${key} must be at least ${min} characters` };
-  if (s.length > max) return { ok: false, error: `${key} must be at most ${max} characters` };
-  return { ok: true, value: s };
-}
-
-export function optionalString(obj, key, { min = 0, max = 200 } = {}) {
-  const v = obj?.[key];
-  if (v === undefined) return { ok: true, value: undefined };
-  if (typeof v !== "string") return { ok: false, error: `${key} must be a string` };
-  const s = v.trim();
-  if (s.length < min) return { ok: false, error: `${key} must be at least ${min} characters` };
-  if (s.length > max) return { ok: false, error: `${key} must be at most ${max} characters` };
-  return { ok: true, value: s };
-}
-
-export function optionalBoolean(obj, key) {
-  const v = obj?.[key];
-  if (v === undefined) return { ok: true, value: undefined };
-  if (typeof v !== "boolean") return { ok: false, error: `${key} must be a boolean` };
-  return { ok: true, value: v };
-}
-EOF
-
-# -------------------------
-# _lib/supabase.mjs
-# -------------------------
-cat > "$LIB_DIR/supabase.mjs" <<'EOF'
-import { createClient } from "@supabase/supabase-js";
-
-let _client = null;
-
-export function getSupabaseEnv() {
+export function assertEnv() {
   const url = process.env.SUPABASE_URL || "";
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
-  return { url, key };
-}
-
-export function ensureSupabaseClient() {
-  const { url, key } = getSupabaseEnv();
-
   if (!url || !key) {
-    return {
-      ok: false,
-      error: "Supabase env not configured",
-      hint: "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env (manual paste), then restart netlify dev.",
-    };
+    const msg =
+      "Missing required env vars for integration tests.\n" +
+      "Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, then re-run.\n\n" +
+      "Example:\n" +
+      "  export SUPABASE_URL='https://xxxxx.supabase.co'\n" +
+      "  export SUPABASE_SERVICE_ROLE_KEY='...'\n" +
+      "  node --test tests/api/*.test.mjs\n";
+    throw new Error(msg);
   }
-
-  if (!_client) {
-    _client = createClient(url, key, {
-      auth: { persistSession: false },
-    });
-  }
-
-  return { ok: true, client: _client };
 }
 
-export function mapDbError(err) {
-  // Low-leak error: preserve message but avoid dumping internal objects.
-  return err?.message || "Database error";
-}
-EOF
-
-# -------------------------
-# projects.mjs
-# -------------------------
-cat > "$TEMPL_DIR/projects.mjs" <<'EOF'
-import { handleOptions, ok, created, badRequest, serverError, methodNotAllowed } from "./_lib/http.mjs";
-import { readJsonBody, requireString } from "./_lib/validate.mjs";
-import { ensureSupabaseClient, mapDbError } from "./_lib/supabase.mjs";
-
-export async function handler(event) {
-  const opt = handleOptions(event);
-  if (opt) return opt;
-
-  const method = (event.httpMethod || "GET").toUpperCase();
-
-  const supa = ensureSupabaseClient();
-  if (!supa.ok) return serverError(supa.error, supa.hint);
-  const supabase = supa.client;
-
-  if (method === "GET") {
-    const { data, error } = await supabase
-      .from("projects")
-      .select("id,name,created_at")
-      .order("created_at", { ascending: false });
-
-    if (error) return serverError(mapDbError(error));
-    return ok(data || []);
-  }
-
-  if (method === "POST") {
-    const body = readJsonBody(event);
-    if (!body.ok) return badRequest(body.error);
-
-    const name = requireString(body.value, "name", { min: 1, max: 120 });
-    if (!name.ok) return badRequest(name.error);
-
-    const { data, error } = await supabase
-      .from("projects")
-      .insert({ name: name.value })
-      .select("id,name,created_at")
-      .single();
-
-    if (error) return serverError(mapDbError(error));
-    return created(data);
-  }
-
-  return methodNotAllowed(method);
-}
-EOF
-
-# -------------------------
-# tasks.mjs
-# -------------------------
-cat > "$TEMPL_DIR/tasks.mjs" <<'EOF'
-import {
-  handleOptions,
-  ok,
-  created,
-  badRequest,
-  serverError,
-  methodNotAllowed,
-  getQuery,
-} from "./_lib/http.mjs";
-import { readJsonBody, requireString, optionalString, optionalBoolean } from "./_lib/validate.mjs";
-import { ensureSupabaseClient, mapDbError } from "./_lib/supabase.mjs";
-
-export async function handler(event) {
-  const opt = handleOptions(event);
-  if (opt) return opt;
-
-  const method = (event.httpMethod || "GET").toUpperCase();
-
-  const supa = ensureSupabaseClient();
-  if (!supa.ok) return serverError(supa.error, supa.hint);
-  const supabase = supa.client;
-
-  if (method === "GET") {
-    const q = getQuery(event);
-    const projectId = q.project_id || "";
-
-    if (!projectId) {
-      return badRequest("project_id query param is required", "Call /tasks?project_id=<uuid>");
+export async function retry(fn, { tries = 5, delayMs = 250 } = {}) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (i < tries - 1) await sleep(delayMs);
     }
-
-    const { data, error } = await supabase
-      .from("tasks")
-      .select("id,project_id,title,done,created_at")
-      .eq("project_id", projectId)
-      .order("created_at", { ascending: false });
-
-    if (error) return serverError(mapDbError(error));
-    return ok(data || []);
   }
-
-  if (method === "POST") {
-    const body = readJsonBody(event);
-    if (!body.ok) return badRequest(body.error);
-
-    const projectId = requireString(body.value, "project_id", { min: 1, max: 80 });
-    if (!projectId.ok) return badRequest(projectId.error);
-
-    const title = requireString(body.value, "title", { min: 1, max: 200 });
-    if (!title.ok) return badRequest(title.error);
-
-    const { data, error } = await supabase
-      .from("tasks")
-      .insert({ project_id: projectId.value, title: title.value, done: false })
-      .select("id,project_id,title,done,created_at")
-      .single();
-
-    if (error) return serverError(mapDbError(error));
-    return created(data);
-  }
-
-  if (method === "PATCH") {
-    const body = readJsonBody(event);
-    if (!body.ok) return badRequest(body.error);
-
-    const id = requireString(body.value, "id", { min: 1, max: 80 });
-    if (!id.ok) return badRequest(id.error);
-
-    const title = optionalString(body.value, "title", { min: 1, max: 200 });
-    if (!title.ok) return badRequest(title.error);
-
-    const isDone = optionalBoolean(body.value, "done");
-    if (!isDone.ok) return badRequest(isDone.error);
-
-    const patch = {};
-    if (title.value !== undefined) patch.title = title.value;
-    if (isDone.value !== undefined) patch.done = isDone.value;
-
-    if (Object.keys(patch).length === 0) {
-      return badRequest("No fields to update", "Provide at least one of: title, done");
-    }
-
-    const { data, error } = await supabase
-      .from("tasks")
-      .update(patch)
-      .eq("id", id.value)
-      .select("id,project_id,title,done,created_at")
-      .single();
-
-    if (error) return serverError(mapDbError(error));
-    return ok(data);
-  }
-
-  if (method === "DELETE") {
-    const q = getQuery(event);
-    const id = q.id || "";
-    if (!id) return badRequest("id query param is required", "Call /tasks?id=<uuid>");
-
-    const { error } = await supabase.from("tasks").delete().eq("id", id);
-    if (error) return serverError(mapDbError(error));
-
-    return ok({ id });
-  }
-
-  return methodNotAllowed(method);
+  throw lastErr;
 }
 EOF
 
-echo "✅ Wrote API function templates to:"
-echo "   $TEMPL_DIR"
+# -------------------------
+# projects.test.mjs
+# -------------------------
+cat > "$OUT_DIR/projects.test.mjs" <<'EOF'
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { handler as projects } from "../../services/api/netlify/functions/projects.mjs";
+import { assertEnv, mkEvent, parseJsonBody, uniqueName } from "./helpers.mjs";
+
+test("projects: GET returns {data: array}", async () => {
+  assertEnv();
+
+  const resp = await projects(mkEvent({ method: "GET" }));
+  assert.equal(resp.statusCode, 200);
+
+  const json = parseJsonBody(resp);
+  assert.ok(json);
+  assert.ok(Array.isArray(json.data));
+});
+
+test("projects: POST creates a project", async () => {
+  assertEnv();
+
+  const name = uniqueName("proj");
+  const resp = await projects(mkEvent({ method: "POST", bodyObj: { name } }));
+  assert.equal(resp.statusCode, 201);
+
+  const json = parseJsonBody(resp);
+  assert.ok(json?.data?.id);
+  assert.equal(json.data.name, name);
+});
+
+test("projects: POST validates body", async () => {
+  assertEnv();
+
+  const resp = await projects(mkEvent({ method: "POST", bodyObj: { name: "" } }));
+  assert.equal(resp.statusCode, 400);
+
+  const json = parseJsonBody(resp);
+  assert.ok(json?.error);
+});
+EOF
+
+# -------------------------
+# tasks.test.mjs
+# -------------------------
+cat > "$OUT_DIR/tasks.test.mjs" <<'EOF'
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { handler as projects } from "../../services/api/netlify/functions/projects.mjs";
+import { handler as tasks } from "../../services/api/netlify/functions/tasks.mjs";
+import { assertEnv, mkEvent, parseJsonBody, uniqueName } from "./helpers.mjs";
+
+async function createProject() {
+  const name = uniqueName("proj");
+  const resp = await projects(mkEvent({ method: "POST", bodyObj: { name } }));
+  assert.equal(resp.statusCode, 201);
+  const json = parseJsonBody(resp);
+  assert.ok(json?.data?.id);
+  return json.data.id;
+}
+
+async function createTask(project_id) {
+  const title = uniqueName("task");
+  const resp = await tasks(mkEvent({ method: "POST", bodyObj: { project_id, title } }));
+  assert.equal(resp.statusCode, 201);
+  const json = parseJsonBody(resp);
+  assert.ok(json?.data?.id);
+  assert.equal(json.data.project_id, project_id);
+  return json.data;
+}
+
+test("tasks: GET requires project_id", async () => {
+  assertEnv();
+
+  const resp = await tasks(mkEvent({ method: "GET" }));
+  assert.equal(resp.statusCode, 400);
+
+  const json = parseJsonBody(resp);
+  assert.ok(json?.error);
+});
+
+test("tasks: full lifecycle (create/list/patch/delete)", async () => {
+  assertEnv();
+
+  const projectId = await createProject();
+
+  // create
+  const t1 = await createTask(projectId);
+
+  // list
+  const listResp = await tasks(mkEvent({ method: "GET", query: { project_id: projectId } }));
+  assert.equal(listResp.statusCode, 200);
+  const listJson = parseJsonBody(listResp);
+  assert.ok(Array.isArray(listJson?.data));
+  assert.ok(listJson.data.some((t) => t.id === t1.id));
+
+  // patch
+  const patchResp = await tasks(
+    mkEvent({
+      method: "PATCH",
+      bodyObj: { id: t1.id, done: true },
+    })
+  );
+  assert.equal(patchResp.statusCode, 200);
+  const patchJson = parseJsonBody(patchResp);
+  assert.equal(patchJson?.data?.id, t1.id);
+  assert.equal(patchJson?.data?.done, true);
+
+  // delete
+  const delResp = await tasks(mkEvent({ method: "DELETE", query: { id: t1.id } }));
+  assert.equal(delResp.statusCode, 200);
+  const delJson = parseJsonBody(delResp);
+  assert.equal(delJson?.data?.id, t1.id);
+});
+EOF
+
+# -------------------------
+# Optional runner script template
+# -------------------------
+RUNNER_DIR="$ROOT_DIR/Scripts/Templates/base/scripts"
+mkdir -p "$RUNNER_DIR"
+
+cat > "$RUNNER_DIR/test-api.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Runs API integration tests (Node built-in test runner).
+# Requires:
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_ROLE_KEY
+#
+# Example:
+#   export SUPABASE_URL="https://xxxxx.supabase.co"
+#   export SUPABASE_SERVICE_ROLE_KEY="..."
+#   ./scripts/test-api.sh
+
+node --test tests/api/*.test.mjs
+EOF
+chmod +x "$RUNNER_DIR/test-api.sh"
+
+echo "✅ Wrote API integration tests to:"
+echo "   $OUT_DIR"
 echo
-echo "Next requirements (make sure these are true in Templates/base/package.json):"
-echo "  - \"type\": \"module\""
-echo "  - dependency: @supabase/supabase-js"
+echo "✅ Wrote optional runner script template to:"
+echo "   $RUNNER_DIR/test-api.sh"
 echo
-echo "Done."
+echo "Next step (if needed): ensure scaffold.sh copies these into new projects:"
+echo "  - Templates/base/tests  -> project/tests"
+echo "  - Templates/base/scripts/test-api.sh -> project/scripts/test-api.sh"
+echo
+echo "Run in a scaffolded project:"
+echo "  export SUPABASE_URL='https://xxxxx.supabase.co'"
+echo "  export SUPABASE_SERVICE_ROLE_KEY='...'"
+echo "  ./scripts/test-api.sh"
