@@ -24,20 +24,22 @@ export default function App() {
     })();
   }, []);
 
+
   useEffect(() => {
     if (!projectId) return;
     (async () => {
       try {
-        const res = await fetch(`/.netlify/functions/tasks?projectId=${encodeURIComponent(projectId)}`);
+        const res = await fetch(`/.netlify/functions/tasks?project_id=${encodeURIComponent(projectId)}`);
         const json = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error((json as any)?.error || `HTTP ${res.status}`);
-        setTasks((json as any)?.tasks ?? []);
+        setTasks((json as any)?.data ?? []);
       } catch (e: any) {
         setError(String(e?.message || e));
         setTasks([]);
       }
     })();
   }, [projectId]);
+
 
   return (
     <div style={{ padding: 16, display: "grid", gridTemplateColumns: "320px 1fr", gap: 16 }}>
