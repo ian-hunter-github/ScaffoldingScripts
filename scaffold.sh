@@ -1,115 +1,213 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ------------------------------------------------------------
-# defaults
-# ------------------------------------------------------------
+# ============================================================
+# scaffold.sh
+#
+# Low-magic, deterministic scaffolder.
+#
+# Creates a local project (idempotent by refusing to overwrite),
+# and copies templates into place. Provisioning is done later by
+# scripts/provision.sh (copied into the project).
+#
+# Template layout (repo):
+#   Scripts/
+#     scaffold.sh
+#     Templates/
+#       base/
+#         netlify.toml
+#         sql/
+#         services/api/netlify/functions/
+#         packages/
+#         package.json
+#         tests/                  (optional)
+#         scripts/test-api.sh     (optional)
+#         supabase.config.json
+#       apps/
+#         web-react/
+#           package.json
+#           src/...
+#         web-vanilla/            (optional)
+#         desktop-tauri/          (placeholder)
+#       provision.sh
+#       check-tools.mjs
+# ============================================================
+
+# ----------------------------
+# Defaults
+# ----------------------------
 UIS=()
 EXAMPLE="minimal"
 DB="none"
 
+# ----------------------------
+# Helpers
+# ----------------------------
 usage() {
   cat <<'TXT'
 Usage:
   scaffold.sh <project-name> [options]
 
 Options:
-  --ui web-react|mobile-react-native|desktop-tauri   (repeatable)
+  --ui web-react|web-vanilla|desktop-tauri   (repeatable)
   --example minimal|advanced
   --db none|supabase
   -h, --help
 
 Examples:
   scaffold.sh myapp --ui web-react
-  scaffold.sh myapp --ui web-react --ui mobile-react-native --example advanced --db supabase
+  scaffold.sh myapp --ui web-react --example advanced --db supabase
+  scaffold.sh myapp --ui desktop-tauri --example minimal --db none
 TXT
 }
 
-log() { printf '[scaffold] %s\n' "$*"; }
-die() { printf '[scaffold] ERROR: %s\n' "$*" >&2; exit 1; }
+log() { echo "ℹ️  $*"; }
+die() { echo "❌ $*" >&2; exit 1; }
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
 
-copy_dir() {
+# Copy directory contents src -> dst (dst created if missing)
+copy_dir_contents() {
   local src="$1" dst="$2"
   [[ -d "$src" ]] || die "Missing template dir: $src"
   mkdir -p "$dst"
   cp -R "$src"/. "$dst"/
 }
 
-create_vite_app() {
+dir_is_empty_or_missing() {
+  local d="$1"
+  [[ ! -e "$d" ]] && return 0
+  [[ -d "$d" ]] || return 1
+  shopt -s dotglob nullglob
+  local items=("$d"/*)
+  shopt -u dotglob nullglob
+  [[ ${#items[@]} -eq 0 ]]
+}
+
+# Create Vite skeleton ONLY (no install). Must be empty/missing dst.
+create_vite_skeleton() {
   local dst="$1" template="$2"
-  [[ -n "$dst" ]] || die "create_vite_app: missing dst"
-  [[ -n "$template" ]] || die "create_vite_app: missing template"
-  [[ ! -e "$dst" ]] || die "Vite destination already exists (refusing to overwrite): $dst"
+  [[ -n "$dst" ]] || die "create_vite_skeleton: missing dst"
+  [[ -n "$template" ]] || die "create_vite_skeleton: missing template"
 
-  log "Creating Vite app: $dst (template=$template)"
+  log "Creating Vite skeleton: $dst (template=$template)"
+
+  if ! dir_is_empty_or_missing "$dst"; then
+    die "Vite destination exists and is not empty (refusing to overwrite): $dst"
+  fi
+
   mkdir -p "$(dirname "$dst")"
+  rm -rf "$dst" 2>/dev/null || true
 
-  # Force non-interactive behaviour.
-  # - CI=1 suppresses prompts in many CLIs
-  # - printf 'n\n' answers the rolldown question “No” if it still appears
-  CI=1 printf 'n\n' | npm create vite@latest "$dst" -- --template "$template" --no-install
+  # Deterministic / non-interactive best-effort:
+  # - don't pipe stdin (can trigger 'Operation cancelled')
+  # - ensure prompts are not needed by guaranteeing an empty destination
+  CI=1 npm_config_yes=true npm create vite@latest "$dst" -- --template "$template" --no-install
 
-  (cd "$dst" && npm install)
+  [[ -f "$dst/index.html" ]] || die "Vite did not create $dst/index.html (create-vite likely cancelled)"
+}
+
+overlay_ui_src() {
+  local ui="$1" dst_app="$2"
+  local src="$TEMPLATES_DIR/apps/$ui/src"
+  [[ -d "$src" ]] || die "Missing UI template src: $src"
+  [[ -d "$dst_app/src" ]] || die "Missing destination src dir: $dst_app/src"
+  cp -R "$src"/. "$dst_app/src/"
 }
 
 write_meta_json() {
   local mode="$1" example="$2" db="$3"
-  node - "$mode" "$example" "$db" "${UIS[@]}" <<'NODE'
-const fs = require('fs');
+  mkdir -p .scaffold
+  # Write ui array safely
+  local ui_json=""
+  if [[ ${#UIS[@]} -gt 0 ]]; then
+    ui_json="$(printf '"%s",' "${UIS[@]}" | sed 's/,$//')"
+  fi
 
-const mode = process.argv[2];
-const example = process.argv[3];
-const db = process.argv[4];
-const uis = process.argv.slice(5);
-
-const meta = { mode, ui: uis, example, db };
-fs.writeFileSync('.scaffold/meta.json', JSON.stringify(meta, null, 2));
-NODE
+  cat > .scaffold/meta.json <<EOF
+{
+  "mode": "$mode",
+  "ui": [${ui_json}],
+  "example": "$example",
+  "db": "$db"
+}
+EOF
 }
 
-overlay_ui_src() {
-  local ui="$1" appdir="$2"
-  local srcdir="$TEMPLATES_DIR/apps/$ui/src"
-  local dstdir="$appdir/src"
-
-  log "Looking for UI template src dir: $srcdir"
-  [[ -d "$srcdir" ]] || die "UI template src dir missing: $srcdir"
-
-  log "Overlaying UI src: $ui -> $dstdir"
-  copy_dir "$srcdir" "$dstdir"
-}
-
-# ------------------------------------------------------------
-# args
-# ------------------------------------------------------------
+# ----------------------------
+# Args
+# ----------------------------
 [[ $# -ge 1 ]] || { usage; exit 1; }
 PROJECT="$1"; shift
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --ui) UIS+=("$2"); shift 2 ;;
-    --example) EXAMPLE="$2"; shift 2 ;;
-    --db) DB="$2"; shift 2 ;;
-    -h|--help) usage; exit 0 ;;
-    *) die "Unknown option: $1" ;;
+    --ui)
+      [[ $# -ge 2 ]] || die "--ui requires a value"
+      UIS+=("$2")
+      shift 2
+      ;;
+    --example)
+      [[ $# -ge 2 ]] || die "--example requires a value"
+      EXAMPLE="$2"
+      shift 2
+      ;;
+    --db)
+      [[ $# -ge 2 ]] || die "--db requires a value"
+      DB="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "Unknown argument: $1"
+      ;;
   esac
 done
 
+# ----------------------------
+# Validate
+# ----------------------------
 [[ "${#UIS[@]}" -gt 0 ]] || die "At least one --ui is required"
-case "$EXAMPLE" in minimal|advanced) ;; *) die "Invalid --example: $EXAMPLE" ;; esac
-case "$DB" in none|supabase) ;; *) die "Invalid --db: $DB" ;; esac
+
+case "$EXAMPLE" in
+  minimal|advanced) ;;
+  *) die "Invalid --example: $EXAMPLE" ;;
+esac
+
+case "$DB" in
+  none|supabase) ;;
+  *) die "Invalid --db: $DB" ;;
+esac
+
+# Optional: enforce "advanced implies supabase" (uncomment if you want)
+# if [[ "$EXAMPLE" == "advanced" && "$DB" != "supabase" ]]; then
+#   die "Advanced example requires --db supabase"
+# fi
+
+# Only allow one web UI (web-react OR web-vanilla), but desktop-tauri can combine.
+web_count=0
+for ui in "${UIS[@]}"; do
+  case "$ui" in
+    web-react|web-vanilla) web_count=$((web_count+1)) ;;
+    desktop-tauri) ;;
+    *) die "Unknown UI: $ui" ;;
+  esac
+done
+[[ "$web_count" -le 1 ]] || die "Only one web UI is allowed (choose web-react OR web-vanilla)"
+
 [[ ! -e "$PROJECT" ]] || die "Path already exists: $PROJECT"
 
 MODE="single"
 [[ "${#UIS[@]}" -gt 1 ]] && MODE="monorepo"
 
-# ------------------------------------------------------------
-# locate Templates
-# ------------------------------------------------------------
+# ----------------------------
+# Locate Templates (relative to this script)
+# ----------------------------
 SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATES_DIR="$SCRIPTS_DIR/Templates"
 
@@ -121,86 +219,117 @@ TEMPLATES_DIR="$SCRIPTS_DIR/Templates"
 need_cmd node
 need_cmd npm
 
-# ------------------------------------------------------------
-# create project
-# ------------------------------------------------------------
-mkdir "$PROJECT"
+# ----------------------------
+# Create project folder
+# ----------------------------
+mkdir -p "$PROJECT"
 cd "$PROJECT"
 
-mkdir -p .scaffold
 write_meta_json "$MODE" "$EXAMPLE" "$DB"
 
+# Copy core scripts into project
 mkdir -p scripts
 cp "$TEMPLATES_DIR/provision.sh" scripts/provision.sh
 cp "$TEMPLATES_DIR/check-tools.mjs" scripts/check-tools.mjs
-chmod +x scripts/provision.sh
+chmod +x scripts/provision.sh || true
 
-# Always create a netlify.toml at repo root
+# netlify.toml at root of project
 cp "$TEMPLATES_DIR/base/netlify.toml" netlify.toml
 
-# ------------------------------------------------------------
-# base templates (advanced example only)
-# ------------------------------------------------------------
+# ----------------------------
+# Advanced base templates
+# ----------------------------
 if [[ "$EXAMPLE" == "advanced" ]]; then
   log "Applying base templates (advanced)"
-  copy_dir "$TEMPLATES_DIR/base/sql" sql
-  copy_dir "$TEMPLATES_DIR/base/services" services
-  copy_dir "$TEMPLATES_DIR/base/packages" packages
 
-  # Support either name, but write as package.json in project root
-  if [[ -f "$TEMPLATES_DIR/base/package.json" ]]; then
-    cp "$TEMPLATES_DIR/base/package.json" package.json
-  elif [[ -f "$TEMPLATES_DIR/base/packages.json" ]]; then
-    cp "$TEMPLATES_DIR/base/packages.json" package.json
+  [[ -d "$TEMPLATES_DIR/base/sql" ]]      || die "Missing template dir: $TEMPLATES_DIR/base/sql"
+  [[ -d "$TEMPLATES_DIR/base/services" ]] || die "Missing template dir: $TEMPLATES_DIR/base/services"
+  [[ -d "$TEMPLATES_DIR/base/packages" ]] || die "Missing template dir: $TEMPLATES_DIR/base/packages"
+
+  copy_dir_contents "$TEMPLATES_DIR/base/sql"      "sql"
+  copy_dir_contents "$TEMPLATES_DIR/base/services" "services"
+  copy_dir_contents "$TEMPLATES_DIR/base/packages" "packages"
+
+  # Copy template tests (optional)
+  if [[ -d "$TEMPLATES_DIR/base/tests" ]]; then
+    log "Copying template tests -> tests/"
+    copy_dir_contents "$TEMPLATES_DIR/base/tests" "tests"
+  else
+    log "No template tests directory found at $TEMPLATES_DIR/base/tests (skipping)"
   fi
 
-  if [[ -f "package.json" ]]; then
+  # Copy optional test runner into project scripts/
+  if [[ -f "$TEMPLATES_DIR/base/scripts/test-api.sh" ]]; then
+    log "Copying test runner -> scripts/test-api.sh"
+    cp "$TEMPLATES_DIR/base/scripts/test-api.sh" scripts/test-api.sh
+    chmod +x scripts/test-api.sh || true
+  fi
+
+  # Root package.json (optional but recommended for advanced)
+  if [[ -f "$TEMPLATES_DIR/base/package.json" ]]; then
+    cp "$TEMPLATES_DIR/base/package.json" package.json
     npm install
   fi
 fi
 
-# DB config template
+# DB config template at project root if supabase
 if [[ "$DB" == "supabase" ]]; then
   [[ -f "$TEMPLATES_DIR/base/supabase.config.json" ]] || die "Missing template: $TEMPLATES_DIR/base/supabase.config.json"
   sed "s/__PROJECT_NAME__/${PROJECT}/g" \
     "$TEMPLATES_DIR/base/supabase.config.json" > supabase.config.json
 fi
 
-# ------------------------------------------------------------
-# apps
-# ------------------------------------------------------------
-mkdir -p apps
-
+# ----------------------------
+# UI targets
+# ----------------------------
 for ui in "${UIS[@]}"; do
   case "$ui" in
     web-react)
-      # 1) Create the Vite app FIRST
-      create_vite_app "apps/web" "react-ts"
+      log "Scaffolding Vite app (react-ts) -> apps/web"
+      mkdir -p apps
 
-      # 2) Option A: template owns package.json for the app
+      # 1) Create Vite skeleton FIRST (must be empty)
+      create_vite_skeleton "apps/web" "react-ts"
+
+      # 2) Template owns deps: replace package.json + install
       if [[ -f "$TEMPLATES_DIR/apps/$ui/package.json" ]]; then
-        log "Copying template package.json for $ui -> apps/web/package.json"
+        log "Replacing Vite package.json with template package.json (advanced deps)"
         cp "$TEMPLATES_DIR/apps/$ui/package.json" "apps/web/package.json"
-        (cd "apps/web" && npm install)
-      else
-        die "Missing template package.json for $ui: $TEMPLATES_DIR/apps/$ui/package.json"
       fi
+      (cd "apps/web" && npm install)
 
-      # 3) Overlay template src/ into the created app
+      # 3) Overlay template src
       overlay_ui_src "$ui" "apps/web"
 
       # Fail loudly if overlay didn't create expected structure
       [[ -f "apps/web/src/App.tsx" ]] || die "Missing apps/web/src/App.tsx after overlay"
       [[ -d "apps/web/src/app" ]] || die "Overlay failed: apps/web/src/app not created"
       ;;
+    web-vanilla)
+      log "Scaffolding Vite app (vanilla-ts) -> apps/web"
+      mkdir -p apps
 
-    mobile-react-native)
-      mkdir -p apps/mobile/src
-      overlay_ui_src "$ui" "apps/mobile"
+      # 1) Create Vite skeleton FIRST
+      create_vite_skeleton "apps/web" "vanilla-ts"
+
+      # 2) Template owns deps (optional)
+      if [[ -f "$TEMPLATES_DIR/apps/$ui/package.json" ]]; then
+        log "Replacing Vite package.json with template package.json (vanilla deps)"
+        cp "$TEMPLATES_DIR/apps/$ui/package.json" "apps/web/package.json"
+      fi
+      (cd "apps/web" && npm install)
+
+      # 3) Overlay template src (if present)
+      if [[ -d "$TEMPLATES_DIR/apps/$ui/src" ]]; then
+        overlay_ui_src "$ui" "apps/web"
+      fi
       ;;
     desktop-tauri)
+      log "Scaffolding desktop placeholder -> apps/desktop"
       mkdir -p apps/desktop/src
-      overlay_ui_src "$ui" "apps/desktop"
+      if [[ -d "$TEMPLATES_DIR/apps/$ui/src" ]]; then
+        cp -R "$TEMPLATES_DIR/apps/$ui/src"/. "apps/desktop/src/"
+      fi
       ;;
     *)
       die "Unknown UI: $ui"
@@ -208,25 +337,16 @@ for ui in "${UIS[@]}"; do
   esac
 done
 
-# ------------------------------------------------------------
-# git init (optional, safe)
-# ------------------------------------------------------------
-if command -v git >/dev/null 2>&1; then
-  if [[ ! -d .git ]]; then
-    git init >/dev/null 2>&1 || true
-    git add -A >/dev/null 2>&1 || true
-    git commit -m "Scaffold project" >/dev/null 2>&1 || true
-  fi
-fi
-
-log "Scaffold complete:"
-log "  project: $PROJECT"
-log "  mode:    $MODE"
-log "  ui:      ${UIS[*]}"
-log "  example: $EXAMPLE"
-log "  db:      $DB"
-log ""
+# ----------------------------
+# Done
+# ----------------------------
+log "Scaffold complete: $PROJECT"
 log "Next:"
 log "  cd $PROJECT"
-log "  ./scripts/provision.sh --create-db --apply-schema"
-log "  netlify dev"
+log "  ./scripts/provision.sh"
+if [[ "$EXAMPLE" == "advanced" ]]; then
+  log "  (advanced) netlify dev"
+  if [[ -x "scripts/test-api.sh" ]]; then
+    log "  (advanced) ./scripts/test-api.sh  # after setting SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY"
+  fi
+fi

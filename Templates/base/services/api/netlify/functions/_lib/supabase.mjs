@@ -29,7 +29,6 @@ export function ensureSupabaseClient() {
 }
 
 export function mapDbError(err) {
-  // Keep it simple and low-leak: show message but not internals.
-  const msg = err?.message || "Database error";
-  return msg;
+  // Low-leak error: preserve message but avoid dumping internal objects.
+  return err?.message || "Database error";
 }
