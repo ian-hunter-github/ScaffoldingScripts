@@ -9,6 +9,6 @@ export type Task = {
   id: string;
   project_id: string;
   title: string;
-  completed: boolean;
+  done: boolean;
   created_at: string;
 };

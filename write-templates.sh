@@ -35,7 +35,7 @@ create table if not exists public.tasks (
   id uuid primary key default gen_random_uuid(),
   project_id uuid not null references public.projects(id) on delete cascade,
   title text not null,
-  completed boolean not null default false,
+  done boolean not null default false,
   created_at timestamptz not null default now()
 );
 SQL
@@ -55,7 +55,7 @@ export type Task = {
   id: string;
   project_id: string;
   title: string;
-  completed: boolean;
+  done: boolean;
   created_at: string;
 };
 TS
