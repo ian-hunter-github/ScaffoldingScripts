@@ -121,7 +121,7 @@ create_vite_skeleton() {
   # Deterministic / non-interactive best-effort:
   # - don't pipe stdin (can trigger 'Operation cancelled')
   # - ensure prompts are not needed by guaranteeing an empty destination
-  CI=1 npm_config_yes=true npm create vite@latest "$dst" -- --template "$template" --no-install
+  CI=1 npm_config_yes=true npx --yes create-vite "$dst" --template "$template" --no-install </dev/null
 
   [[ -f "$dst/index.html" ]] || die "Vite did not create $dst/index.html (create-vite likely cancelled)"
 }
