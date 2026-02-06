@@ -10,6 +10,13 @@ set -euo pipefail
 # and copies templates into place. Provisioning is done later by
 # scripts/provision.sh (copied into the project).
 #
+# NEW (Git/GitHub):
+# - Requires `gh` to be installed and logged in (aborts otherwise)
+# - Initializes local git repo (if missing)
+# - Attempts to create GitHub repo (if missing), otherwise continues
+# - Commits scaffolded files locally
+# - Ensures remote `origin` points to GitHub and pushes `main`
+#
 # Template layout (repo):
 #   Scripts/
 #     scaffold.sh
@@ -40,6 +47,12 @@ UIS=()
 EXAMPLE="minimal"
 DB="none"
 
+# GitHub defaults
+# - Set GITHUB_OWNER to override (e.g. export GITHUB_OWNER="ian-hunter-github")
+# - Set GITHUB_VISIBILITY to override: private|public (default private)
+GITHUB_OWNER="${GITHUB_OWNER:-ian-hunter-github}"
+GITHUB_VISIBILITY="${GITHUB_VISIBILITY:-private}"
+
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -53,6 +66,10 @@ Options:
   --example minimal|advanced
   --db none|supabase
   -h, --help
+
+Environment:
+  GITHUB_OWNER        GitHub owner/user/org (default: ian-hunter-github)
+  GITHUB_VISIBILITY   private|public (default: private)
 
 Examples:
   scaffold.sh myapp --ui web-react
@@ -136,6 +153,95 @@ write_meta_json() {
 EOF
 }
 
+require_gh_logged_in() {
+  need_cmd gh
+  # `gh auth status` returns non-zero when not authenticated
+  gh auth status -h github.com >/dev/null 2>&1 || die "GitHub CLI not logged in. Run: gh auth login"
+}
+
+git_init_if_needed() {
+  if [[ -d ".git" ]]; then
+    log "Git repo already exists"
+  else
+    need_cmd git
+    log "Initializing local git repo"
+    git init >/dev/null
+    # Ensure main
+    git branch -M main >/dev/null 2>&1 || true
+  fi
+}
+
+git_commit_scaffolded_changes() {
+  # Ensure we can commit even if user has no global git identity set
+  if ! git config user.name >/dev/null 2>&1; then
+    git config user.name "scaffold.sh"
+  fi
+  if ! git config user.email >/dev/null 2>&1; then
+    git config user.email "scaffold@local"
+  fi
+
+  git add -A
+
+  # If nothing to commit, don't fail the script
+  if git diff --cached --quiet; then
+    log "No changes to commit"
+    return 0
+  fi
+
+  log "Committing scaffolded files"
+  git commit -m "Initial scaffold" >/dev/null
+}
+
+ensure_github_repo_and_push() {
+  local owner="$1" repo="$2"
+  local full_repo="${owner}/${repo}"
+
+  # Validate visibility
+  case "$GITHUB_VISIBILITY" in
+    private|public) ;;
+    *) die "Invalid GITHUB_VISIBILITY: $GITHUB_VISIBILITY (use private|public)" ;;
+  esac
+
+  log "Ensuring GitHub repo exists: $full_repo"
+
+  if gh repo view "$full_repo" >/dev/null 2>&1; then
+    log "GitHub repo already exists: $full_repo"
+  else
+    log "Creating GitHub repo: $full_repo ($GITHUB_VISIBILITY)"
+    # Create without prompts
+    if [[ "$GITHUB_VISIBILITY" == "private" ]]; then
+      gh repo create "$full_repo" --private >/dev/null
+    else
+      gh repo create "$full_repo" --public >/dev/null
+    fi
+  fi
+
+  # Ensure origin remote is set correctly
+  local origin_url="https://github.com/${full_repo}.git"
+
+  if git remote get-url origin >/dev/null 2>&1; then
+    # If origin exists but is different, make it deterministic by setting it
+    local current
+    current="$(git remote get-url origin 2>/dev/null || true)"
+    if [[ "$current" != "$origin_url" && "$current" != "git@github.com:${full_repo}.git" ]]; then
+      log "Updating origin remote -> $origin_url"
+      git remote set-url origin "$origin_url"
+    else
+      log "Origin remote already set"
+    fi
+  else
+    log "Adding origin remote -> $origin_url"
+    git remote add origin "$origin_url"
+  fi
+
+  # Ensure branch name is main
+  git branch -M main >/dev/null 2>&1 || true
+
+  # Push (set upstream). If no commits exist, push would fail; we commit earlier.
+  log "Pushing main -> origin (set upstream)"
+  git push -u origin main >/dev/null
+}
+
 # ----------------------------
 # Args
 # ----------------------------
@@ -184,11 +290,6 @@ case "$DB" in
   *) die "Invalid --db: $DB" ;;
 esac
 
-# Optional: enforce "advanced implies supabase" (uncomment if you want)
-# if [[ "$EXAMPLE" == "advanced" && "$DB" != "supabase" ]]; then
-#   die "Advanced example requires --db supabase"
-# fi
-
 # Only allow one web UI (web-react OR web-vanilla), but desktop-tauri can combine.
 web_count=0
 for ui in "${UIS[@]}"; do
@@ -218,6 +319,10 @@ TEMPLATES_DIR="$SCRIPTS_DIR/Templates"
 
 need_cmd node
 need_cmd npm
+need_cmd git
+
+# GitHub CLI must exist and be logged in (abort otherwise)
+require_gh_logged_in
 
 # ----------------------------
 # Create project folder
@@ -345,9 +450,17 @@ for ui in "${UIS[@]}"; do
 done
 
 # ----------------------------
+# Git / GitHub setup (after files exist)
+# ----------------------------
+git_init_if_needed
+git_commit_scaffolded_changes
+ensure_github_repo_and_push "$GITHUB_OWNER" "$PROJECT"
+
+# ----------------------------
 # Done
 # ----------------------------
 log "Scaffold complete: $PROJECT"
+log "GitHub: https://github.com/$GITHUB_OWNER/$PROJECT"
 log "Next:"
 log "  cd $PROJECT"
 log "  ./scripts/provision.sh"

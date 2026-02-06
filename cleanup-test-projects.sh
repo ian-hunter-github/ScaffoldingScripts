@@ -56,6 +56,68 @@ need_cmd node
 need_cmd awk
 need_cmd sed
 need_cmd grep
+need_cmd gh
+
+delete_test_repo() {
+  local NAME="$1"
+
+  if [[ -z "$NAME" ]]; then
+    echo "delete_test_repo: missing project name" >&2
+    return 1
+  fi
+
+  local TESTS_DIR="${HOME}/Projects/Tests"
+  local PROJECT_DIR="${TESTS_DIR}/${NAME}"
+
+  # 1) Verify local folder exists
+  if [[ ! -d "$PROJECT_DIR" ]]; then
+    echo "[skip] Local folder does not exist: $PROJECT_DIR" >&2
+    return 1
+  fi
+
+  # 2) Verify gh is available and authenticated
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "[error] gh CLI not installed" >&2
+    return 1
+  fi
+
+  if ! gh auth status >/dev/null 2>&1; then
+    echo "[error] gh not authenticated" >&2
+    return 1
+  fi
+
+  # 3) Resolve owner from current auth context
+  local OWNER
+  OWNER="$(gh api user --jq .login 2>/dev/null)" || {
+    echo "[error] Failed to resolve GitHub user" >&2
+    return 1
+  }
+
+  local REPO="${OWNER}/${NAME}"
+
+  # 4) Verify repo exists
+  if ! gh repo view "$REPO" >/dev/null 2>&1; then
+    echo "[skip] GitHub repo does not exist: $REPO"
+    return 0
+  fi
+
+  # 5) Final confirmation
+  echo
+  echo "About to DELETE GitHub repo:"
+  echo "  Local folder : $PROJECT_DIR"
+  echo "  GitHub repo  : $REPO"
+  read -rp "Type the repo name to confirm deletion: " CONFIRM
+
+  if [[ "$CONFIRM" != "$NAME" ]]; then
+    echo "[abort] Confirmation mismatch"
+    return 1
+  fi
+
+  # 6) Delete repo
+  gh repo delete "$REPO" --confirm
+
+  echo "[ok] Deleted GitHub repo: $REPO"
+}
 
 # ------------------------------------------------------------
 # Netlify cleanup (text mode)
@@ -215,6 +277,11 @@ else
     fi
   fi
 fi
+
+for d in "${HOME}/Projects/Tests"/test-*; do
+  [[ -d "$d" ]] || continue
+  delete_test_repo "$(basename "$d")"
+done
 
 echo
 echo "Cleanup complete."
